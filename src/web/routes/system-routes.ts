@@ -8,7 +8,7 @@ import { FastifyInstance } from 'fastify';
 import { join, dirname } from 'node:path';
 import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { homedir, totalmem, freemem, loadavg, cpus } from 'node:os';
+import { homedir, totalmem, freemem, cpus } from 'node:os';
 import { execSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { ApiErrorCode, createErrorResponse, getErrorMessage, type NiceConfig } from '../../types.js';
@@ -37,7 +37,29 @@ const MAX_SCREENSHOT_SIZE = 10 * 1024 * 1024;
 const SCREENSHOTS_DIR = join(homedir(), '.codeman', 'screenshots');
 
 /** Cached CPU count — doesn't change at runtime */
-const CPU_COUNT = cpus().length;
+// Busy% from cumulative core-time deltas between polls. loadavg measures
+// queue depth (threads waiting a turn), not busy time — under many short
+// thread wakeups it pegs while cores sit idle, so it must not feed a CPU gauge.
+function cpuTimes(): { total: number; idle: number } {
+  let total = 0;
+  let idle = 0;
+  for (const c of cpus()) {
+    total += c.times.user + c.times.nice + c.times.sys + c.times.idle + c.times.irq;
+    idle += c.times.idle;
+  }
+  return { total, idle };
+}
+
+let prevCpu = cpuTimes();
+
+function cpuBusyPercent(): number {
+  const now = cpuTimes();
+  const dTotal = now.total - prevCpu.total;
+  const dIdle = now.idle - prevCpu.idle;
+  prevCpu = now;
+  if (dTotal <= 0) return 0;
+  return Math.min(100, Math.max(0, Math.round(((dTotal - dIdle) / dTotal) * 100)));
+}
 
 /** Get system CPU and memory usage */
 function getSystemStats(): {
@@ -65,9 +87,7 @@ function getSystemStats(): {
       usedMem = totalMem - freemem();
     }
 
-    // CPU load average (1 min) as percentage (rough approximation)
-    const load = loadavg()[0];
-    const cpuPercent = Math.min(100, Math.round((load / CPU_COUNT) * 100));
+    const cpuPercent = cpuBusyPercent();
 
     return {
       cpu: cpuPercent,

@@ -245,6 +245,46 @@ function setOpenCodeEnvVars(muxName: string): void {
 }
 
 /**
+ * Stamp a per-session git identity onto a tmux session via setenv, derived from
+ * the session's display name. Every commit from this session is then attributable
+ * to the session — and it overrides any repo-local user.name, because the
+ * GIT_AUTHOR and GIT_COMMITTER env vars beat all git config files. This is the
+ * only mechanism that distinguishes sessions sharing one working dir.
+ *
+ * The session env is inherited by panes and persists across respawns, so a
+ * rename re-runs this and the next (re)spawn — resume, clear, pane respawn —
+ * commits under the new name. A currently-running process keeps its spawn-time
+ * identity until it respawns.
+ */
+function setGitIdentityEnvVars(muxName: string, name: string | undefined): void {
+  if (IS_TEST_MODE) return;
+  const author = (name ?? '').trim();
+  if (!author) return;
+  // Slug the name into a stable email local-part (e.g. "w1-axon" -> w1-axon@codeman.local)
+  const local = author.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  const email = `${local || 'session'}@codeman.local`;
+  const identity: Record<string, string> = {
+    GIT_AUTHOR_NAME: author,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: author,
+    GIT_COMMITTER_EMAIL: email,
+  };
+  for (const [key, val] of Object.entries(identity)) {
+    // Shell-escape: wrap in single quotes, escape any inner single quotes
+    const escaped = val.replace(/'/g, "'\\''");
+    try {
+      execSync(`tmux setenv -t '${muxName}' ${key} '${escaped}'`, {
+        encoding: 'utf8',
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      /* Non-critical — git identity is best-effort */
+    }
+  }
+}
+
+/**
  * Set OPENCODE_CONFIG_CONTENT on a tmux session via setenv.
  * Uses tmux setenv to avoid shell metacharacter injection from user-supplied JSON.
  */
@@ -493,6 +533,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         setOpenCodeEnvVars(muxName);
         setOpenCodeConfigContent(muxName, openCodeConfig);
       }
+
+      // Per-session git identity so commits are attributable to this session
+      // (and override any repo-local user.name). Inherited by the pane below.
+      setGitIdentityEnvVars(muxName, name);
 
       // Replace the shell with the actual command (no echo in terminal)
       execSync(`tmux respawn-pane -k -t "${muxName}" bash -c ${JSON.stringify(fullCmd)}`, {
@@ -877,6 +921,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
     session.name = name;
     this.saveSessions();
+    // Update the live session's git identity so the next (re)spawn commits
+    // under the new name. The running process keeps its identity until respawn.
+    setGitIdentityEnvVars(session.muxName, name);
     return true;
   }
 
